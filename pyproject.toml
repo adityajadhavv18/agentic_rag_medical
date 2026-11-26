@@ -3,6 +3,9 @@ name = "agentic-rag-medical"
 version = "0.1.0"
 requires-python = ">=3.13"
 dependencies = [
+    "modal>=1.6.4",
     "pymupdf>=2.1",
+    "pyobjc-framework-quartz>=13.1",
+    "pyobjc-framework-vision>=13.1",
     "tokenizers>=0.23.3",
 ]
