@@ -1,8 +1,9 @@
 """Phase 1 OCR bake-off on Modal (L4 GPU, no queue). Replaces the Kaggle notebook.
 
     caffeinate -i uv run modal run --detach ingest/modal_ocr.py::paddle    # PaddleOCR-VL 1.6
-    caffeinate -i uv run modal run --detach ingest/modal_ocr.py::olmocr    # olmOCR-2 7B
-    uv run ingest/modal_ocr.py fetch paddle|olmocr                         # copy results to data/phase1/results/
+    caffeinate -i uv run modal run --detach ingest/modal_ocr.py::olmocr    # olmOCR-2 7B (transformers, 1 page at a time)
+    caffeinate -i uv run modal run --detach ingest/modal_ocr.py::olmocr_vllm   # olmOCR-2 FP8 on vLLM: 12 test + 24 timing
+    uv run ingest/modal_ocr.py fetch paddle|olmocr|olmocr_vllm             # copy results from the volume
 
 Each model is its own Modal app, so a failed image build for one never blocks the other.
 
@@ -102,21 +103,23 @@ paddle_vllm_image = paddle_image.run_commands(
 ).apt_install("build-essential")  # Triton (inside vLLM) compiles small C launchers at startup: needs gcc
 
 
-def start_vllm(model: str, port: int = 8000, timeout: int = 1200):
-    """Start `vllm serve` in the background and wait until it answers; raise with its log tail if it dies."""
+PADDLE_VLLM_CMD = [
+    "/opt/vllm/bin/vllm", "serve", PADDLE_VL_MODEL, "--served-model-name", PADDLE_VL_MODEL, "--trust-remote-code",
+    "--max-num-batched-tokens", "16384", "--no-enable-prefix-caching", "--mm-processor-cache-gb", "0",
+    "--gpu-memory-utilization", "0.5", "--port", "8000",
+    # PaddleOCR's client sends per-request image-size settings (mm_processor_kwargs); recent vLLM rejects them
+    # unless trusted. Safe here: the only client is our own pipeline, on localhost, in the same container.
+    "--trust-request-mm-kwargs"]
+
+
+def start_vllm(cmd: list[str], port: int = 8000, timeout: int = 1200):
+    """Start `vllm serve` (cmd) in the background and wait until it answers; raise with its log tail if it dies."""
     import os
     import subprocess
     import urllib.request
     env = dict(os.environ, HF_HOME=f"{MNT}/hf")
     log = open("/tmp/vllm.log", "w")
-    proc = subprocess.Popen(
-        ["/opt/vllm/bin/vllm", "serve", model, "--served-model-name", model, "--trust-remote-code",
-         "--max-num-batched-tokens", "16384", "--no-enable-prefix-caching", "--mm-processor-cache-gb", "0",
-         "--gpu-memory-utilization", "0.5", "--port", str(port),
-         # PaddleOCR's client sends per-request image-size settings (mm_processor_kwargs); recent vLLM rejects them
-         # unless trusted. Safe here: the only client is our own pipeline, on localhost, in the same container.
-         "--trust-request-mm-kwargs"],
-        stdout=log, stderr=subprocess.STDOUT, env=env)
+    proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, env=env)
     deadline = time.time() + timeout
     while True:
         if proc.poll() is not None:
@@ -139,7 +142,7 @@ def run_paddle(pdf_bytes: bytes) -> None:
                          capture_output=True, text=True).stdout.strip()
 
     def load():
-        start_vllm(PADDLE_VL_MODEL)  # before PaddlePaddle touches the GPU, so vLLM sees the free memory it asks for
+        start_vllm(PADDLE_VLLM_CMD)  # before PaddlePaddle touches the GPU, so vLLM sees the free memory it asks for
         vol.commit()  # keep the downloaded VL weights for reruns
         from paddleocr import PaddleOCRVL
         pipe = PaddleOCRVL(pipeline_version="v1.6", vl_rec_backend="vllm-server",
@@ -190,15 +193,118 @@ def run_olmocr(pdf_bytes: bytes) -> None:
               load, read_page)  # 1288 px longest side, as the model card says
 
 
+# ---- olmOCR-2 fast mode: vLLM + FP8 -------------------------------------------------------------------------------
+# The transformers run above reads one page at a time: 96 s/page on an L4, i.e. ~46 GPU-hours (~$37) for the ~1,717
+# scanned pages. Here vLLM serves the FP8 copy of the model (allenai/olmOCR-2-7B-1025-FP8, the olmOCR README's serving
+# example: `vllm serve ... --max-model-len 16384`) and reads many pages at once. Same prompt, same 1288 px pictures as
+# the transformers run, so only the engine and the number format change. FP8 runs natively on compute capability 8.9
+# (L4, L40S); A10G (8.6) is left out on purpose.
+TIMING = ROOT / "data" / "timing"
+OLMO_FP8 = "allenai/olmOCR-2-7B-1025-FP8"
+olmo_vllm_app = modal.App("mbbs-ocr-olmocr-vllm")
+olmo_vllm_image = (
+    modal.Image.debian_slim(python_version="3.11")
+    .apt_install("libgl1", "libglib2.0-0", "build-essential")  # Triton (inside vLLM) needs gcc at startup
+    .uv_pip_install("vllm>=0.11.1", "pymupdf", "pyyaml", index_url="https://pypi.org/simple")
+    .uv_pip_install("olmocr>=0.4.0", extra_options="--no-deps")  # only its prompt builder is used
+    .env({"HF_HOME": f"{MNT}/hf"})
+)
+OLMO_VLLM_CMD = ["vllm", "serve", OLMO_FP8, "--served-model-name", "olmocr", "--max-model-len", "16384",
+                 "--gpu-memory-utilization", "0.90", "--port", "8000"]
+MAX_TOKENS, TEMPS = 8192, (0.1, 0.3)  # a page that stops at MAX_TOKENS (usually a repeat loop) is retried once warmer
+
+
+@olmo_vllm_app.function(image=olmo_vllm_image, gpu=["L4", "L40S"], timeout=3600, volumes={MNT: vol})
+def run_olmocr_vllm(batches: dict, concurrency: int = 24) -> dict:
+    """batches: {tag: (page-name prefix, pdf bytes)}. Each batch is sent all at once (up to `concurrency` pages in
+    flight); every page is written to olmocr_vllm/<tag>/ as it finishes; timings and token counts go to log.json."""
+    import base64
+    import subprocess
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import vllm
+    from openai import OpenAI
+    from olmocr.prompts import build_no_anchoring_v4_yaml_prompt
+    t_start = time.time()
+    gpu = subprocess.run(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+                         capture_output=True, text=True).stdout.strip()
+    start_vllm(OLMO_VLLM_CMD)
+    vol.commit()  # keep the FP8 weights on the volume for the full run
+    ready = time.time() - t_start
+    client = OpenAI(base_url="http://127.0.0.1:8000/v1", api_key="EMPTY", timeout=1800)
+    prompt = build_no_anchoring_v4_yaml_prompt()
+
+    def ocr(png: bytes):
+        t = time.time()
+        b64 = base64.b64encode(png).decode()
+        messages = [{"role": "user", "content": [{"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}}]}]
+        for attempt, temp in enumerate(TEMPS, start=1):
+            r = client.chat.completions.create(model="olmocr", messages=messages, temperature=temp,
+                                               max_tokens=MAX_TOKENS)
+            if r.choices[0].finish_reason == "stop":
+                break
+        c = r.choices[0]
+        return c.message.content or "", {"seconds": round(time.time() - t, 1), "finish": c.finish_reason,
+                                         "attempts": attempt, "in_tokens": r.usage.prompt_tokens,
+                                         "out_tokens": r.usage.completion_tokens}
+
+    summary = {"model": OLMO_FP8, "engine": f"vLLM {vllm.__version__}", "gpu": gpu, "concurrency": concurrency,
+               "server_ready_seconds": round(ready, 1), "batches": {}}
+    for tag, (prefix, pdf_bytes) in batches.items():
+        out = Path(MNT) / "olmocr_vllm" / tag
+        out.mkdir(parents=True, exist_ok=True)
+        pngs = pages_as_png(pdf_bytes, longest=1288)
+        log, t0 = {"model": f"{OLMO_FP8} on {summary['engine']} ({gpu})", "pages": {}}, time.time()
+        with ThreadPoolExecutor(min(concurrency, len(pngs))) as ex:
+            futs = {ex.submit(ocr, png): f"{prefix}{i:02d}" for i, png in enumerate(pngs, start=1)}
+            for f in as_completed(futs):
+                name = futs[f]
+                try:
+                    text, meta = f.result()
+                    (out / f"{name}.md").write_text(text)
+                    log["pages"][name] = {"chars": len(text), **meta}
+                except Exception as e:
+                    log["pages"][name] = {"error": repr(e)}
+                print(name, log["pages"][name].get("seconds", log["pages"][name].get("error")), flush=True)
+        ok = [v for v in log["pages"].values() if "seconds" in v]
+        stats = {"n_pages": len(pngs), "pages_ok": len(ok), "wall_seconds": round(time.time() - t0, 1),
+                 "out_tokens": sum(v["out_tokens"] for v in ok), "retried": sum(v["attempts"] > 1 for v in ok),
+                 "hit_max_tokens": sum(v["finish"] != "stop" for v in ok)}
+        log.update(stats, load_seconds=round(ready, 1))
+        (out / "log.json").write_text(json.dumps(log, indent=1))
+        vol.commit()
+        summary["batches"][tag] = stats
+    summary["container_seconds"] = round(time.time() - t_start, 1)
+    (Path(MNT) / "olmocr_vllm" / "summary.json").write_text(json.dumps(summary, indent=1))
+    vol.commit()
+    return summary
+
+
+def fetch_dir(remote: str, local: Path) -> int:
+    """Copy the files (not sub-folders) of a volume folder into a local folder; returns how many."""
+    local.mkdir(parents=True, exist_ok=True)
+    n = 0
+    for entry in vol.listdir(remote):
+        if entry.type != modal.volume.FileEntryType.FILE:
+            continue
+        (local / Path(entry.path).name).write_bytes(b"".join(vol.read_file(entry.path)))
+        n += 1
+    return n
+
+
+def fetch_olmocr_vllm() -> None:
+    a = fetch_dir("olmocr_vllm/phase1", PHASE1 / "results" / "olmocr_vllm")
+    b = fetch_dir("olmocr_vllm/timing", TIMING / "results" / "olmocr_vllm")
+    fetch_dir("olmocr_vllm", TIMING / "results")  # summary.json
+    print(f"olmocr_vllm: fetched {a} files (12 test pages) + {b} files (24 timing pages)")
+
+
 def fetch(engine: str) -> None:
     """Copy phase1/<engine>/ from the volume into data/phase1/results/<engine>/."""
+    if engine == "olmocr_vllm":
+        return fetch_olmocr_vllm()
     dst = PHASE1 / "results" / engine
-    dst.mkdir(parents=True, exist_ok=True)
-    n = 0
-    for entry in vol.listdir(f"phase1/{engine}"):
-        name = Path(entry.path).name
-        (dst / name).write_bytes(b"".join(vol.read_file(entry.path)))
-        n += 1
+    n = fetch_dir(f"phase1/{engine}", dst)
     log = json.loads((dst / "log.json").read_text())
     ok = [v for v in log["pages"].values() if "seconds" in v]
     print(f"{engine}: fetched {n} files, {len(ok)} pages ok, load {log.get('load_seconds')} s, "
@@ -215,6 +321,15 @@ def paddle():
 def olmocr():
     run_olmocr.remote((PHASE1 / "phase1_pages.pdf").read_bytes())
     fetch("olmocr")
+
+
+@olmo_vllm_app.local_entrypoint()
+def olmocr_vllm(concurrency: int = 24):
+    """12 scored test pages (quality vs the transformers run) + 24 random pages (timing), one container."""
+    summary = run_olmocr_vllm.remote({"phase1": ("T", (PHASE1 / "phase1_pages.pdf").read_bytes()),
+                                      "timing": ("P", (TIMING / "timing_pages.pdf").read_bytes())}, concurrency)
+    fetch_olmocr_vllm()
+    print(json.dumps(summary, indent=1))
 
 
 if __name__ == "__main__" and len(sys.argv) == 3 and sys.argv[1] == "fetch":
